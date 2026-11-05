@@ -1,0 +1,20 @@
+fastapi==0.162.0
+uvicorn[standard]==0.40.0
+aiosqlite==0.22.1
+sqlalchemy==2.0.51
+pydantic==2.13.4
+pydantic-settings==2.14.2
+python-multipart==0.0.32
+PyJWT==2.13.0
+bcrypt==5.0.0
+scikit-learn==1.9.0
+numpy==2.4.6
+httpx==0.28.1
+pytest==9.0.3
+pytest-asyncio==1.4.1
+sentence-transformers==6.2.0
+torch==2.15.0
+# Optional / heavier (install for full demo):
+# faster-whisper   # voice transcription
+# open-clip-torch  # image embeddings (P1)
+# ollama python client or plain httpx to http://localhost:11434
