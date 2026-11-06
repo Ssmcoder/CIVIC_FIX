@@ -1,0 +1,36 @@
+# Render blueprint — deploys backend (web) + frontend (static) together.
+# Set the env vars marked REQUIRED in the dashboard before first deploy.
+services:
+  - type: web
+    name: crowdresolve-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: SECRET_KEY
+        generateValue: true
+      - key: TRACKING_HASH_KEYS
+        generateValue: true
+      - key: IP_HASH_KEY
+        generateValue: true
+      - key: FERNET_KEY
+        generateValue: true
+      - key: CORS_ORIGINS
+        value: https://crowdresolve-web.onrender.com
+      - key: DATABASE_URL
+        value: sqlite+aiosqlite:////data/civicfix.db
+    disk:
+      name: civicfix-data
+      mountPath: /data
+      sizeGB: 1
+
+  - type: web
+    name: crowdresolve-web
+    runtime: static
+    buildCommand: cd frontend && npm ci && npm run build
+    staticPublishPath: frontend/dist
+    envVars:
+      - key: VITE_API_URL
+        value: https://crowdresolve-api.onrender.com
