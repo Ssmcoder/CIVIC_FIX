@@ -21,7 +21,8 @@ def utcnow() -> datetime:
 
 
 def new_id() -> str:
-    return uuid.uuid4().hex[:12]
+    # CF-17: full uuid4 hex (128-bit) for all identifiers.
+    return uuid.uuid4().hex
 
 
 # ---------------------------------------------------------------- reference
@@ -60,7 +61,15 @@ class Admin(Base):
     # state_admin|district_admin|municipal_admin|ward_admin|super_admin
     jurisdiction_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("jurisdictions.id"), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    totp_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    totp_secret: Mapped[str | None] = mapped_column(String(200), nullable=True)  # Fernet-encrypted
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    backup_codes: Mapped[str] = mapped_column(Text, default="[]")  # JSON list of hashed codes
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
+    # CF-15 lockout
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    lock_count: Mapped[int] = mapped_column(Integer, default=0)  # for backoff
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -176,6 +185,9 @@ class Evidence(Base):
     size_bytes: Mapped[int] = mapped_column(Integer, default=0)
     caption: Mapped[str] = mapped_column(Text, default="")
     is_resolution: Mapped[bool] = mapped_column(Boolean, default=False)
+    uploader_type: Mapped[str] = mapped_column(String(20), default="citizen")  # citizen|admin|field_worker
+    marked_by: Mapped[str | None] = mapped_column(String(64), nullable=True)   # admin id who flagged resolution
+    marked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     complaint: Mapped[Complaint] = relationship(back_populates="evidence")
 
@@ -276,6 +288,7 @@ class AuditLog(Base):
     entity_type: Mapped[str] = mapped_column(String(40))
     entity_id: Mapped[str] = mapped_column(String(64))
     detail: Mapped[str] = mapped_column(Text, default="")  # JSON
+    ip_hash: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -283,6 +296,7 @@ class ChatSession(Base):
     __tablename__ = "chat_sessions"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     ip_hash: Mapped[str] = mapped_column(String(128), default="")
+    token_hash: Mapped[str] = mapped_column(String(128), default="", index=True)  # CF-08 session credential
     state: Mapped[str] = mapped_column(Text, default="{}")  # JSON dialogue state
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
@@ -301,6 +315,53 @@ class ChatMessage(Base):
     scope: Mapped[str] = mapped_column(String(20), default="civic")  # civic|out_of_scope|unclear
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     session: Mapped[ChatSession] = relationship(back_populates="messages")
+
+
+class IncidentSupport(Base):
+    """'I am also affected' — idempotent support votes on an incident (CF-23)."""
+    __tablename__ = "incident_support"
+    __table_args__ = (UniqueConstraint("incident_id", "complaint_id"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    incident_id: Mapped[str] = mapped_column(String(64), ForeignKey("incidents.id"), index=True)
+    complaint_id: Mapped[str] = mapped_column(String(64), ForeignKey("complaints.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class AdminSession(Base):
+    """Refresh-token session family for admin auth (CF-15)."""
+    __tablename__ = "admin_sessions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)  # jti
+    admin_id: Mapped[str] = mapped_column(String(64), ForeignKey("admins.id"), index=True)
+    family_id: Mapped[str] = mapped_column(String(64), index=True)
+    refresh_hash: Mapped[str] = mapped_column(String(128))
+    user_agent: Mapped[str] = mapped_column(String(300), default="")
+    ip_hash: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    last_used_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    idle_expires_at: Mapped[datetime] = mapped_column(DateTime)
+    absolute_expires_at: Mapped[datetime] = mapped_column(DateTime)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    rotated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class IdCounter(Base):
+    """DB-side counter for human-readable public complaint IDs (CF-21)."""
+    __tablename__ = "id_counters"
+    name: Mapped[str] = mapped_column(String(40), primary_key=True)
+    value: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class MlRetrainJob(Base):
+    """Background retraining job record (CF-16)."""
+    __tablename__ = "ml_retrain_jobs"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    admin_id: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="queued")  # queued|running|done|failed
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    log_tail: Mapped[str] = mapped_column(Text, default="")
+    metrics: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class MlFeedback(Base):

@@ -25,6 +25,7 @@ from ..models import (
     ChatMessage, ChatSession, Complaint, Department, Incident, IncidentReport,
     MlFeedback, StatusHistory,
 )
+from ..security import redact_text
 from ..services import pipeline
 from ..taxonomy import CATEGORIES
 
@@ -95,30 +96,11 @@ def scope_guard(text: str) -> tuple[str, float]:
 
 
 async def classify_scope_with_model(text: str) -> tuple[str, float]:
-    """Layer-2: optional ML head for scope; falls back to rules."""
-    scope, conf = scope_guard(text)
-    # Try trained scope model if present
-    try:
-        import pickle
-        from pathlib import Path
-        p = Path(get_settings().ml_model_dir) / "scope_head.pkl"
-        if p.exists():
-            with open(p, "rb") as f:
-                head = pickle.load(f)
-            from ..services.embeddings import embed_one
-            import numpy as np
-            emb = embed_one(text).reshape(1, -1)
-            proba = head["model"].predict_proba(emb)[0]
-            classes = list(head["model"].classes_)
-            label = classes[int(np.argmax(proba))]
-            p_conf = float(np.max(proba))
-            if label == "out_of_scope" and p_conf > 0.7:
-                return "out_of_scope", p_conf
-            if label == "civic" and p_conf > 0.6:
-                return "civic", p_conf
-    except Exception as e:  # noqa: BLE001
-        log.debug("scope model unavailable: %s", e)
-    return scope, conf
+    """Scope classification. The ML scope head was removed for CF-12 (unsafe
+    per-request pickle); the deterministic two-layer guard below is the
+    enforced boundary. A trained head can be re-added via the verified
+    model-store path in services/classify.py."""
+    return scope_guard(text)
 
 
 # ------------------------------------------------------------------ tools
@@ -130,8 +112,8 @@ async def tool_find_nearby_incidents(db: AsyncSession, lat: float | None,
         return []
     from ..services.location import haversine_m
     res = await db.execute(select(Incident).where(
-        Incident.status.in_(["open", "in_progress", "awaiting_verification", "reopened"],
-                            Incident.lat.isnot(None), Incident.lon.isnot(None))))
+        Incident.status.in_(["open", "in_progress", "awaiting_verification", "reopened"]),
+        Incident.lat.isnot(None), Incident.lon.isnot(None)))
     out = []
     for i in res.scalars().all():
         d = haversine_m(lat, lon, i.lat, i.lon)
@@ -269,7 +251,7 @@ async def handle_message(db: AsyncSession, session: ChatSession, text: str,
                                   "pole", "wire", "manhole", "broken", "blocked", "road",
                                   "sadak", "bijli", "pani", "nalika", "jama", "kacha")):
             # start intake with this as description seed
-            intake.description = user_text
+            intake.description = redact_text(user_text)
             cls = _quick_classify(user_text)
             intake.category = cls["category"] if cls else ""
             state.update({"mode": "intake", "intake": intake.to_dict()})
@@ -425,7 +407,7 @@ async def _handle_intake(db: AsyncSession, session: ChatSession, state: dict,
             session.state = json.dumps(state)
             await db.commit()
             return await handle_message(db, session, text)
-        intake.description = text
+        intake.description = redact_text(text)
         cls = _quick_classify(text)
         if cls:
             intake.category = cls["category"]
@@ -521,7 +503,8 @@ async def _submit_intake(db: AsyncSession, session: ChatSession, state: dict,
     card = {
         "type": "complaint_created",
         "public_id": complaint.public_id,
-        "tracking_token": token,
+        # CF-08: never place the tracking secret in chat cards/messages
+        "tracking_shown": True,
         "status": complaint.status,
         "category": complaint.category,
         "category_label": CATEGORIES.get(complaint.category, complaint.category),
@@ -538,8 +521,9 @@ async def _submit_intake(db: AsyncSession, session: ChatSession, state: dict,
              f"Category: {CATEGORIES.get(complaint.category, complaint.category)}\n"
              f"Priority: {complaint.priority_band} (score {complaint.priority_score})\n"
              f"Status: under review — an administrator will pick it up.\n\n"
-             f"**Save your tracking secret** (needed to check status): `{token}`\n"
-             "Anyone with the ID alone cannot see details.")
+             "**Your tracking code was shown on the confirmation card — "
+             "save it now; I can't show it again.** Anyone with the ID alone "
+             "cannot see details.")
     if getattr(complaint, "_pipeline", {}).get("match_candidates"):
         reply += "\n\nI found similar open reports — you can support the existing incident instead of duplicating."
     return Turn(reply=reply, quick_replies=QUICK_REPLIES, card=card,

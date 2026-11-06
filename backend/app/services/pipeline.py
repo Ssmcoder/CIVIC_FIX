@@ -30,12 +30,17 @@ from . import sla as sla_svc
 log = logging.getLogger(__name__)
 
 
+from ..security import hash_tracking_token, tracking_secret
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def hash_token(token: str) -> str:
-    return hashlib.sha256((token + get_settings().tracking_token_secret).encode()).hexdigest()
+    """Legacy shim: returns 'kid:hash' composite for DB storage (CF-02)."""
+    kid, h = hash_tracking_token(token)
+    return f"{kid}:{h}"
 
 
 def gen_public_id(seq: int) -> str:
@@ -44,20 +49,20 @@ def gen_public_id(seq: int) -> str:
 
 
 async def _next_public_id(db: AsyncSession) -> str:
-    res = await db.execute(select(Complaint.public_id))
-    ids = [r[0] for r in res.all() if r[0]]
-    if not ids:
-        return gen_public_id(1)
-    # find max seq for current year
+    """DB-side counter (CF-21) — no full-table scan, race-safe via upsert."""
+    from ..models import IdCounter
     year = str(utcnow().year)
-    maxseq = 0
-    for pid in ids:
-        if pid.startswith(f"CFX-{year}-"):
-            try:
-                maxseq = max(maxseq, int(pid.rsplit("-", 1)[1]))
-            except ValueError:
-                pass
-    return gen_public_id(maxseq + 1)
+    name = f"complaint-{year}"
+    # SQLite/Postgres portable increment
+    res = await db.execute(select(IdCounter).where(IdCounter.name == name))
+    ctr = res.scalar_one_or_none()
+    if ctr is None:
+        ctr = IdCounter(name=name, value=0)
+        db.add(ctr)
+        await db.flush()
+    ctr.value += 1
+    await db.flush()
+    return gen_public_id(ctr.value)
 
 
 async def _resolve_jurisdiction(db: AsyncSession, ward_name: str | None,
@@ -117,11 +122,12 @@ async def create_complaint(db: AsyncSession, *, description: str,
         text = "(no description provided)"
 
     public_id = await _next_public_id(db)
-    tracking_token = secrets.token_urlsafe(24)
+    tracking_token = tracking_secret()
+    kid, thash = hash_tracking_token(tracking_token)
 
     complaint = Complaint(
         public_id=public_id,
-        tracking_token_hash=hash_token(tracking_token),
+        tracking_token_hash=f"{kid}:{thash}",
         description=description or text,
         transcript=transcript,
         language=language or "en",
@@ -156,10 +162,10 @@ async def create_complaint(db: AsyncSession, *, description: str,
         if cls["confidence"] < settings.classify_review_threshold and not category_override:
             review_reasons.append(f"low classification confidence ({cls['confidence']:.2f})")
     except Exception as e:  # noqa: BLE001
-        log.exception("classification failed")
+        log.exception("classification failed rid-pipe")
         complaint.category = category_override or "other"
         complaint.ai_confidence = 0.0
-        complaint.ai_explanation = f"classification error: {e}"
+        complaint.ai_explanation = "pipeline_error:classification_failed"
         review_reasons.append("classification step failed")
         db.add(MlFeedback(kind="citizen_override", complaint_id=complaint.id,
                           input_text=classify_svc.strip_pii(text),
@@ -200,7 +206,7 @@ async def create_complaint(db: AsyncSession, *, description: str,
         complaint._location_method = loc.method  # type: ignore[attr-defined]
     except Exception as e:  # noqa: BLE001
         log.exception("location resolution failed")
-        review_reasons.append(f"location resolution failed: {e}")
+        review_reasons.append("pipeline_error:location_resolution_failed")
         complaint.location_confidence = 0.0
 
     # ---- Step 4: duplicate detection ----
@@ -227,7 +233,7 @@ async def create_complaint(db: AsyncSession, *, description: str,
             steps_done.append("no_duplicates")
     except Exception as e:  # noqa: BLE001
         log.exception("dedup failed")
-        review_reasons.append(f"duplicate check failed: {e}")
+        review_reasons.append("pipeline_error:dedup_failed")
 
     # ---- Step 5: priority + SLA + routing (deterministic) ----
     try:
@@ -265,8 +271,8 @@ async def create_complaint(db: AsyncSession, *, description: str,
         log.exception("priority/SLA failed")
         complaint.priority_band = "medium"
         complaint.priority_score = 40.0
-        complaint.priority_factors = json.dumps({"error": str(e)})
-        review_reasons.append("priority/SLA step failed")
+        complaint.priority_factors = json.dumps({"error_code": "pipeline_error:priority_sla_failed"})
+        review_reasons.append("pipeline_error:priority_sla_failed")
 
     # ---- status + history ----
     if review_reasons:

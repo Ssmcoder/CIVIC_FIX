@@ -22,14 +22,60 @@ log = logging.getLogger(__name__)
 
 _MODEL_PATH = Path(get_settings().ml_model_dir) / "category_head.pkl"
 _head = None  # {"model": sklearn, "label_encoder": ..., "version": str, "thresholds": {...}}
+_head_loaded = False
+
+
+def _verify_model_file(path: Path) -> bool:
+    """CF-12: verify SHA-256 against pinned manifest before unpickling."""
+    import hashlib
+    manifest = get_settings().ml_model_manifest
+    if not manifest:
+        # no manifest configured -> refuse pickle loads in production,
+        # allow in dev with a loud warning
+        if get_settings().is_production:
+            log.error("ML model manifest not configured; refusing to load %s", path)
+            return False
+        log.warning("No ML_MODEL_MANIFEST; loading %s unverified (dev only)", path.name)
+        return True
+    mpath = Path(manifest)
+    if not mpath.is_absolute():
+        mpath = Path(__file__).resolve().parents[3] / mpath
+    try:
+        lines = mpath.read_text().splitlines()
+        expected = None
+        for line in lines:
+            if line.strip().startswith("#") or not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].lstrip("*").endswith(path.name):
+                expected = parts[0].strip()
+                break
+        if expected is None:
+            log.error("No manifest entry for %s", path.name)
+            return False
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != expected:
+            log.error("Model file hash mismatch for %s", path.name)
+            return False
+        # refuse group/world-writable files
+        mode = path.stat().st_mode
+        if mode & 0o022:
+            log.error("Model file %s is group/world-writable", path.name)
+            return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.error("Manifest verification failed: %s", e)
+        return False
 
 
 def _load_head():
-    global _head
-    if _head is not None:
+    """Load the sklearn head ONCE at first use, manifest-verified (CF-12)."""
+    global _head, _head_loaded
+    if _head_loaded:
         return _head
+    _head_loaded = True
     try:
-        if _MODEL_PATH.exists():
+        if _MODEL_PATH.exists() and _MODEL_PATH.is_absolute() and _verify_model_file(_MODEL_PATH):
             with open(_MODEL_PATH, "rb") as f:
                 _head = pickle.load(f)
             log.info("Loaded category head v%s", _head.get("version"))
